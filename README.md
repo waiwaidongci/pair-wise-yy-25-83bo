@@ -32,5 +32,10 @@ python -m unittest discover -s tests -v
 - `GET /api/batches/{id}/consistency`
 - `POST /api/batches/{id}/freeze`
 - `GET /api/batches/{id}/gold`
+- `POST /api/reworks`、`GET /api/batches/{id}/reworks?status=pending|done`
 
-一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条至少有两人标注、没有未仲裁分歧；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。
+一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条至少有两人标注、没有未仲裁分歧、没有待处理返工；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。
+
+## 抽检返工
+
+管理员可对已提交标注发起返工单（`POST /api/reworks`，含抽检意见）。同一标注（条目+标注员）在待处理期间不能重复建单（部分唯一索引兜底）；标注员在条目详情中可看到待返工意见，重新提交标注后工单才置为已处理并记录完成时间。存在待返工时批次不能冻结。冻结时会把每次标签修订（`annotation_revisions` → `gold_annotations`）和全部返工单（抽检原因、发起/完成时间，`reworks` → `gold_reworks`）快照固化，导出接口 `records` 之外另返回 `annotations` 与 `reworks` 两个历史列表。页面“抽检返工”区可发起返工、查看待返工并按状态筛选已处理记录。

@@ -59,6 +59,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.db.consistency(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "gold":
                 return self._json(200, self.db.export_gold(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "reworks":
+                status = parse_qs(parsed.query).get("status", [None])[0]
+                return self._json(200, {"reworks": self.db.list_reworks(int(parts[2]), status)})
             self._json(404, {"ok": False, "error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -83,6 +86,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": self.db.adjudicate(int(body.get("item_id", 0)), str(body.get("final_label", "")), str(body.get("reason", "")), int(body.get("arbitrator_id", 0)))})
             if path == "/api/discussions":
                 return self._json(201, {"ok": True, "id": self.db.add_discussion(int(body.get("item_id", 0)), int(body.get("author_id", 0)), str(body.get("body", "")), bool(body.get("contains_answer", False)))})
+            if path == "/api/reworks":
+                return self._json(201, {"ok": True, "id": self.db.create_rework(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), int(body.get("manager_id", 0)), str(body.get("reason", "")))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "freeze":
                 return self._json(200, {"ok": True, **self.db.freeze_batch(int(parts[2]), int(body.get("manager_id", 0)))})
             self._json(404, {"ok": False, "error": "接口不存在"})
