@@ -81,7 +81,7 @@ class CorpusDB:
               label TEXT NOT NULL,
               comment TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL,
-              UNIQUE(item_id, annotator_id, guideline_id)
+              superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1))
             );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +100,22 @@ class CorpusDB:
               contains_answer INTEGER NOT NULL DEFAULT 0 CHECK(contains_answer IN (0,1)),
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reworks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+              annotator_id INTEGER NOT NULL REFERENCES users(id),
+              manager_id INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL,
+              previous_label TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done')),
+              resolved_annotation_id INTEGER REFERENCES annotations(id),
+              new_label TEXT NOT NULL DEFAULT '',
+              completed_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reworks_pending
+              ON reworks(item_id,annotator_id) WHERE status='pending';
+            CREATE INDEX IF NOT EXISTS idx_reworks_batch ON reworks(item_id,status);
             CREATE TABLE IF NOT EXISTS gold_records (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
@@ -108,7 +124,9 @@ class CorpusDB:
               label TEXT NOT NULL,
               source TEXT NOT NULL CHECK(source IN ('consensus','adjudication')),
               adjudication_id INTEGER REFERENCES adjudications(id),
-              frozen_at TEXT NOT NULL
+              frozen_at TEXT NOT NULL,
+              annotations_json TEXT NOT NULL DEFAULT '[]',
+              reworks_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS batch_freezes (
               batch_id INTEGER PRIMARY KEY REFERENCES batches(id),
@@ -118,7 +136,43 @@ class CorpusDB:
             );
             """
         )
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(annotations)")}
+        if cols and "superseded" not in cols:
+            # 旧库的 annotations 带有 (item_id,annotator_id,guideline_id) 唯一约束，
+            # 无法保留每次标签，需重建为版本留痕结构。
+            # 旧表 UNIQUE 自动索引无法 DROP，故采用：建新表 -> 复制 -> 删旧表 -> 改名。
+            self.conn.executescript(
+                """
+                CREATE TABLE annotations_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                  annotator_id INTEGER NOT NULL REFERENCES users(id),
+                  guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+                  label TEXT NOT NULL,
+                  comment TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1))
+                );
+                INSERT INTO annotations_new(id,item_id,annotator_id,guideline_id,label,comment,created_at,superseded)
+                  SELECT id,item_id,annotator_id,guideline_id,label,comment,created_at,0 FROM annotations;
+                DROP TABLE annotations;
+                ALTER TABLE annotations_new RENAME TO annotations;
+                """
+            )
+        gold_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(gold_records)")}
+        if gold_cols and "annotations_json" not in gold_cols:
+            self.conn.execute("ALTER TABLE gold_records ADD COLUMN annotations_json TEXT NOT NULL DEFAULT '[]'")
+        if gold_cols and "reworks_json" not in gold_cols:
+            self.conn.execute("ALTER TABLE gold_records ADD COLUMN reworks_json TEXT NOT NULL DEFAULT '[]'")
+        # 此时 annotations 一定是含 superseded 的新结构（新库直接建表，旧库已重建）。
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_annotations_current "
+            "ON annotations(item_id,annotator_id,guideline_id) WHERE superseded=0"
+        )
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -208,26 +262,85 @@ class CorpusDB:
             raise DomainError("只能提交已分配条目的标注")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
+        created_at = datetime.now().isoformat()
         with self.transaction():
             self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
-            try:
-                cur = self.conn.execute(
-                    "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, annotator_id, item["guideline_id"], label.strip(), comment.strip(), datetime.now().isoformat()),
-                )
-            except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE annotations SET label=?,comment=?,created_at=? WHERE item_id=? AND annotator_id=? AND guideline_id=?",
-                    (label.strip(), comment.strip(), datetime.now().isoformat(), item_id, annotator_id, item["guideline_id"]),
-                )
-                annotation_id = self.conn.execute(
-                    "SELECT id FROM annotations WHERE item_id=? AND annotator_id=? AND guideline_id=?",
-                    (item_id, annotator_id, item["guideline_id"]),
-                ).fetchone()["id"]
-            else:
-                annotation_id = int(cur.lastrowid)
+            # 旧标签整体留痕（superseded=1），新提交成为当前版本，保留每次标签与时间。
+            self.conn.execute(
+                "UPDATE annotations SET superseded=1 WHERE item_id=? AND annotator_id=? AND guideline_id=? AND superseded=0",
+                (item_id, annotator_id, item["guideline_id"]),
+            )
+            cur = self.conn.execute(
+                "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at,superseded) VALUES(?,?,?,?,?,?,0)",
+                (item_id, annotator_id, item["guideline_id"], label.strip(), comment.strip(), created_at),
+            )
+            annotation_id = int(cur.lastrowid)
+            # 重新提交即完成该标注名下的待处理返工单，记录新标签与完成时间。
+            self.conn.execute(
+                "UPDATE reworks SET status='done',resolved_annotation_id=?,new_label=?,completed_at=? "
+                "WHERE item_id=? AND annotator_id=? AND status='pending'",
+                (annotation_id, label.strip(), created_at, item_id, annotator_id),
+            )
             self.conn.execute("UPDATE assignments SET status='submitted' WHERE id=?", (assignment["id"],))
         return int(annotation_id)
+
+    def create_rework(self, item_id: int, annotator_id: int, manager_id: int, reason: str) -> int:
+        """管理员从已提交标注发起抽检返工单。"""
+        if not reason.strip():
+            raise DomainError("返工意见不能为空")
+        manager = self.conn.execute("SELECT role FROM users WHERE id=?", (manager_id,)).fetchone()
+        if not manager or manager["role"] != "manager":
+            raise DomainError("只有管理员可以发起返工")
+        item = self.conn.execute(
+            "SELECT i.*,b.status,b.guideline_id FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+        ).fetchone()
+        if not item:
+            raise DomainError("条目不存在")
+        if item["status"] == "frozen":
+            raise DomainError("批次已冻结，不能发起返工")
+        assignment = self.conn.execute(
+            "SELECT * FROM assignments WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+        ).fetchone()
+        if not assignment:
+            raise DomainError("该标注员没有领取此条目")
+        current = self.conn.execute(
+            "SELECT label FROM annotations WHERE item_id=? AND annotator_id=? AND superseded=0",
+            (item_id, annotator_id),
+        ).fetchone()
+        if not current:
+            raise DomainError("只能对已提交的标注发起返工")
+        pending = self.conn.execute(
+            "SELECT id FROM reworks WHERE item_id=? AND annotator_id=? AND status='pending'",
+            (item_id, annotator_id),
+        ).fetchone()
+        if pending:
+            raise DomainError("该标注存在待处理返工，不能重复建单")
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO reworks(item_id,annotator_id,manager_id,reason,previous_label,created_at,status) "
+                "VALUES(?,?,?,?,?,?,'pending')",
+                (item_id, annotator_id, manager_id, reason.strip(), current["label"], datetime.now().isoformat()),
+            )
+        return int(cur.lastrowid)
+
+    def list_reworks(self, status: str | None = None, batch_id: int | None = None) -> list[dict]:
+        where, params = [], []
+        if status:
+            if status not in {"pending", "done"}:
+                raise DomainError("返工状态只能是 pending 或 done")
+            where.append("r.status=?")
+            params.append(status)
+        if batch_id is not None:
+            where.append("i.batch_id=?")
+            params.append(batch_id)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = self.conn.execute(
+            "SELECT r.*,u.name AS annotator_name,m.name AS manager_name,i.ordinal,i.batch_id "
+            "FROM reworks r JOIN users u ON u.id=r.annotator_id JOIN users m ON m.id=r.manager_id "
+            "JOIN items i ON i.id=r.item_id " + clause + " ORDER BY r.id DESC",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_discussion(self, item_id: int, author_id: int, body: str, contains_answer: bool = False) -> int:
         if not body.strip():
@@ -252,8 +365,13 @@ class CorpusDB:
         if not item:
             raise DomainError("条目不存在")
         own = self.conn.execute(
-            "SELECT id,label,comment,created_at FROM annotations WHERE item_id=? AND annotator_id=?", (item_id, user_id)
+            "SELECT id,label,comment,created_at FROM annotations WHERE item_id=? AND annotator_id=? AND superseded=0",
+            (item_id, user_id),
         ).fetchone()
+        pending_reworks = [dict(r) for r in self.conn.execute(
+            "SELECT id,reason,previous_label,created_at FROM reworks WHERE item_id=? AND annotator_id=? AND status='pending' ORDER BY id",
+            (item_id, user_id),
+        ).fetchall()]
         revealed = own is not None
         discussions = []
         for row in self.conn.execute(
@@ -265,6 +383,7 @@ class CorpusDB:
                 discussions.append(dict(row))
         payload = dict(item)
         payload["own_annotation"] = dict(own) if own else None
+        payload["pending_reworks"] = pending_reworks
         payload["discussions"] = discussions
         return payload
 
@@ -276,7 +395,7 @@ class CorpusDB:
         for item in self.conn.execute("SELECT * FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall():
             rows = self.conn.execute(
                 "SELECT a.*,u.name FROM annotations a JOIN users u ON u.id=a.annotator_id "
-                "WHERE a.item_id=? AND a.guideline_id=? ORDER BY a.id",
+                "WHERE a.item_id=? AND a.guideline_id=? AND a.superseded=0 ORDER BY a.id",
                 (item["id"], batch["guideline_id"]),
             ).fetchall()
             labels = {row["label"] for row in rows}
@@ -297,7 +416,9 @@ class CorpusDB:
             raise DomainError("条目或仲裁员无效")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能重新仲裁")
-        rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT label FROM annotations WHERE item_id=? AND superseded=0", (item_id,)
+        ).fetchall()
         if len(rows) < 2:
             raise DomainError("至少需要两份标注才能仲裁")
         if not final_label.strip() or len(reason.strip()) < 5:
@@ -328,7 +449,8 @@ class CorpusDB:
         all_annotation_count = 0
         for item in items:
             labels = [r["label"] for r in self.conn.execute(
-                "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                "SELECT label FROM annotations WHERE item_id=? AND guideline_id=? AND superseded=0",
+                (item["id"], batch["guideline_id"])
             ).fetchall()]
             if len(labels) < 2:
                 per_item.append({"item_id": item["id"], "ordinal": item["ordinal"], "agreement": None, "annotations": len(labels)})
@@ -367,13 +489,20 @@ class CorpusDB:
         items = self.conn.execute("SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         if not items:
             raise DomainError("空批次不能冻结")
+        pending_rework = self.conn.execute(
+            "SELECT 1 FROM reworks r JOIN items i ON i.id=r.item_id WHERE i.batch_id=? AND r.status='pending' LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if pending_rework:
+            raise DomainError("存在待返工记录，批次不能冻结")
         disagreements = self.disagreements(batch_id)
         if disagreements:
             raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
         missing = []
         for item in items:
             count = self.conn.execute(
-                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=? AND superseded=0",
+                (item["id"], batch["guideline_id"])
             ).fetchone()[0]
             if count < 2:
                 missing.append(item["id"])
@@ -384,16 +513,37 @@ class CorpusDB:
         with self.transaction():
             for item in items:
                 labels = [r["label"] for r in self.conn.execute(
-                    "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                    "SELECT label FROM annotations WHERE item_id=? AND guideline_id=? AND superseded=0",
+                    (item["id"], batch["guideline_id"])
                 ).fetchall()]
                 adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
                 if adj:
                     label, source, adj_id = adj["final_label"], "adjudication", adj["id"]
                 else:
                     label, source, adj_id = labels[0], "consensus", None
+                # 固化每条标注的全部版本（每次标签、提交时间）与抽检返工记录。
+                annotation_history = [
+                    {"label": r["label"], "comment": r["comment"], "created_at": r["created_at"],
+                     "annotator_id": r["annotator_id"], "superseded": r["superseded"]}
+                    for r in self.conn.execute(
+                        "SELECT label,comment,created_at,annotator_id,superseded FROM annotations "
+                        "WHERE item_id=? AND guideline_id=? ORDER BY id", (item["id"], batch["guideline_id"])
+                    ).fetchall()
+                ]
+                rework_history = [
+                    {"annotator_id": r["annotator_id"], "manager_id": r["manager_id"], "reason": r["reason"],
+                     "previous_label": r["previous_label"], "new_label": r["new_label"],
+                     "created_at": r["created_at"], "completed_at": r["completed_at"], "status": r["status"]}
+                    for r in self.conn.execute(
+                        "SELECT * FROM reworks WHERE item_id=? ORDER BY id", (item["id"],)
+                    ).fetchall()
+                ]
                 self.conn.execute(
-                    "INSERT INTO gold_records(batch_id,item_id,guideline_id,label,source,adjudication_id,frozen_at) VALUES(?,?,?,?,?,?,?)",
-                    (batch_id, item["id"], batch["guideline_id"], label, source, adj_id, frozen_at),
+                    "INSERT INTO gold_records(batch_id,item_id,guideline_id,label,source,adjudication_id,"
+                    "frozen_at,annotations_json,reworks_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (batch_id, item["id"], batch["guideline_id"], label, source, adj_id, frozen_at,
+                     json.dumps(annotation_history, ensure_ascii=False),
+                     json.dumps(rework_history, ensure_ascii=False)),
                 )
             self.conn.execute(
                 "INSERT INTO batch_freezes(batch_id,metrics_json,frozen_by,frozen_at) VALUES(?,?,?,?)",
@@ -408,12 +558,22 @@ class CorpusDB:
             raise DomainError("只有已冻结批次可以导出金标准")
         freeze = self.conn.execute("SELECT * FROM batch_freezes WHERE batch_id=?", (batch_id,)).fetchone()
         rows = self.conn.execute(
-            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at,g.annotations_json,g.reworks_json "
+            "FROM gold_records g JOIN items i ON i.id=g.item_id "
             "WHERE g.batch_id=? ORDER BY i.ordinal", (batch_id,)
         ).fetchall()
+        records = []
+        for row in rows:
+            record = {
+                "item_id": row["item_id"], "ordinal": row["ordinal"], "text": row["text"],
+                "label": row["label"], "source": row["source"], "frozen_at": row["frozen_at"],
+                "annotations": json.loads(row["annotations_json"]),
+                "reworks": json.loads(row["reworks_json"]),
+            }
+            records.append(record)
         return {
             "batch_id": batch_id, "batch_name": batch["name"], "frozen_at": freeze["frozen_at"],
-            "metrics": json.loads(freeze["metrics_json"]), "records": [dict(row) for row in rows],
+            "metrics": json.loads(freeze["metrics_json"]), "records": records,
         }
 
     def snapshot(self) -> dict:
@@ -422,4 +582,6 @@ class CorpusDB:
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "reworks": self.list_reworks(),
+            "annotations": [dict(r) for r in self.conn.execute("SELECT * FROM annotations ORDER BY id")],
         }
